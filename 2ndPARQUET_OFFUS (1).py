@@ -38,6 +38,7 @@ def main():
     batch_size = 5_000_000  # Number of rows per batch
     max_workers = 20  # Number of threads
 
+
     print(f"Table name : PBBDW.{tablename}", flush=True)
 
     # === CONNECT TO ORACLE ===
@@ -73,13 +74,23 @@ def main():
     print("[INFO] Fetching schema from Oracle...", flush=True)
     oracle_schema = get_oracle_schema()
 
-    # === RESUME FROM CHECKPOINT ===
+    # === RESUME FROM CHECKPOINT (kept for compatibility/logging) ===
+    # NOTE: We no longer rely on this for correctness under concurrency.
     last_completed_batch = -1
     if os.path.exists(checkpoint_file):
         with open(checkpoint_file, "r") as f:
-            last_completed_batch = int(f.read().strip())
+            txt = f.read().strip()
+            if txt:
+                last_completed_batch = int(txt)
+                
+    print(f"[INFO] (Info only) checkpoint says last completed batch = {last_completed_batch}", flush=True)
 
-    print(f"[INFO] Resuming from batch {last_completed_batch + 1}", flush=True)
+    # Helper to standardize batch file paths (maintainable)
+    def batch_paths(batch_number: int):
+        parquet_file = os.path.join(parquet_dir, f"{tablename}_year2024_batch{batch_number}.parquet")
+        tmp_file = parquet_file + ".tmp"
+        done_file = parquet_file + ".done"
+        return parquet_file, tmp_file, done_file
 
     # === EXTRACT DATA FROM ORACLE & SAVE AS PARQUET ===
     connection = create_ora_con_pbbdw()
@@ -90,7 +101,13 @@ def main():
                                          AND TO_TIMESTAMP('{end_valid_dttm}','YYYY-MM-DD HH24:MI:SS')""")
 
     def process_batch(batch_number, rows, cursor_description):
-        """Process a batch: Convert to Arrow Table and write to Parquet using DuckDB."""
+        """Process a batch: Convert to Arrow Table and write to Parquet using DuckDB (crash-safe)."""
+        parquet_file, tmp_file, done_file = batch_paths(batch_number)
+
+        # If already completed in a previous run, skip
+        if os.path.exists(done_file):
+            return
+
         col_names = [col[0] for col in cursor_description]
         
         # Build PyArrow Table directly from rows
@@ -98,18 +115,30 @@ def main():
             [dict(zip(col_names, row)) for row in rows],
             schema=oracle_schema
         )
+
+        # Clean leftover tmp from crash
+        if os.path.exists(tmp_file):
+            os.remove(tmp_file)
         
-        parquet_file = f"{parquet_dir}{tablename}_year2024_batch{batch_number}.parquet"
-        
-        # Use DuckDB to write parquet (faster than pyarrow)
+        # Use DuckDB to write parquet (faster than pyarrow) -> write to tmp first
         conn = duckdb.connect()
         conn.register("batch_tbl", table)
-        conn.execute(f"COPY batch_tbl TO '{parquet_file}' (FORMAT PARQUET)")
+        conn.execute(f"COPY batch_tbl TO '{tmp_file}' (FORMAT PARQUET)")
         conn.close()
+
+        # Atomic rename tmp -> final
+        os.replace(tmp_file, parquet_file)
+
+        # Write done marker only after parquet is finalized
+        with open(done_file, "w") as f:
+            f.write(datetime.now().isoformat())
         
-        # Save checkpoint
-        with open(checkpoint_file, "w") as f:
-            f.write(str(batch_number))
+        # Save checkpoint for progress visibility only (not used for correctness)
+        try:
+            with open(checkpoint_file, "w") as f:
+                f.write(str(batch_number))
+        except Exception:
+            pass
 
         # Log every 10 batches
         if batch_number % 10 == 0:
@@ -128,7 +157,10 @@ def main():
             if not rows:
                 break
 
-            if batch_number <= last_completed_batch:
+            parquet_file, tmp_file, done_file = batch_paths(batch_number)
+
+            # Skip processing if already completed previously
+            if os.path.exists(done_file):
                 batch_number += 1
                 continue
 
@@ -137,7 +169,9 @@ def main():
 
             # Only wait when we have "too many" tasks pending; wait for ONE to finish
             if len(futures) >= MAX_INFLIGHT:
-                done, futures = concurrent.futures.wait(futures, return_when=concurrent.futures.FIRST_COMPLETED)
+                done, futures = concurrent.futures.wait(
+                    futures, return_when=concurrent.futures.FIRST_COMPLETED
+                )
 
     # Drain remaining tasks at the end
     concurrent.futures.wait(futures)
@@ -147,19 +181,37 @@ def main():
 
     print("[INFO] Extraction complete. Merging Parquet files...", flush=True)
 
-    # === MERGE PARQUET FILES INTO SINGLE FILE USING DUCKDB ===
-    pattern = os.path.join(parquet_dir, f"{tablename}_year2024_batch*.parquet")
-    
-    # Use DuckDB to merge all batch files efficiently
+    # === MERGE ONLY COMPLETED BATCHES (.done present) USING DUCKDB ===
+    done_pattern = os.path.join(parquet_dir, f"{tablename}_year2024_batch*.parquet.done")
+    done_markers = sorted(glob.glob(done_pattern))
+    batch_files = [d.replace(".done", "") for d in done_markers]
+
+    if not batch_files:
+        raise RuntimeError(f"No completed batches found to merge for {tablename} year2024 (no .done markers).")
+
+    # Use DuckDB to merge all completed batch files efficiently
     conn = duckdb.connect()
-    conn.execute(f"COPY (SELECT * FROM read_parquet('{pattern}')) TO '{output_file}' (FORMAT PARQUET)")
+    files_sql = ",".join([f"'{p}'" for p in batch_files])
+    conn.execute(f"COPY (SELECT * FROM read_parquet([{files_sql}])) TO '{output_file}' (FORMAT PARQUET)")
     conn.close()
+
+    # Delete only merged batch files + done markers after successful merge
+    for file in batch_files:
+        if os.path.exists(file):
+            os.remove(file)
+    for d in done_markers:
+        if os.path.exists(d):
+            os.remove(d)
+
+    # Cleanup leftover tmp files (safe housekeeping)
+    tmp_pattern = os.path.join(parquet_dir, f"{tablename}_year2024_batch*.parquet.tmp")
+    for t in glob.glob(tmp_pattern):
+        try:
+            os.remove(t)
+        except Exception:
+            pass
     
-    # Delete batch files after successful merge
-    for file in glob.glob(pattern):
-        os.remove(file)
-    
-    print(f"[INFO] Successfully merged all batch files into {output_file}", flush=True)
+    print(f"[INFO] Successfully merged all completed batch files into {output_file}", flush=True)
 
     # === PARQUET FILE VALIDATION ===
     def get_oracle_stat(tablename, field_name, start_valid_dttm, end_valid_dttm):
@@ -244,7 +296,9 @@ def main():
     # === VALIDATE AND MOVE TO FINAL FOLDER DELETE CHECKPOINT FILE ===
     if oracle_count == parquet_count and oracle_max == parquet_max and oracle_min == parquet_min:
         move_parquet_file(output_file)
-        os.remove(checkpoint_file)
+        # checkpoint file is no longer required for correctness; remove it to avoid confusion
+        if os.path.exists(checkpoint_file):
+            os.remove(checkpoint_file)
         print("SUCCESS : Conversion complete and file moved", flush=True)
     else:
         print("FAILED : Please check again", flush=True)
