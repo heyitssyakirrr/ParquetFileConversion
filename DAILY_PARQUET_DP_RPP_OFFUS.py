@@ -109,6 +109,7 @@ def main():
         print(table.schema)
         parquet_file = f"{parquet_dir}{tablename}batch{batch_number}.parquet"
         pq.write_table(table, parquet_file)
+        
         # Save checkpoint
         with open(checkpoint_file, "w") as f:
             f.write(str(batch_number))
@@ -160,7 +161,7 @@ def main():
     concurrent.futures.wait(concurrent.futures.futures)
 
     """
-    
+
     cursor.close()
     connection.close()
 

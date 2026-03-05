@@ -140,7 +140,7 @@ def main():
                 done, futures = concurrent.futures.wait(futures, return_when=concurrent.futures.FIRST_COMPLETED)
 
     # Drain remaining tasks at the end
-    concurrent.futures.wait(concurrent.futures.futures)
+    concurrent.futures.wait(futures)
 
     cursor.close()
     connection.close()
