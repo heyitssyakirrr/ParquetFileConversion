@@ -4,8 +4,7 @@ from pathlib import Path
 import re
 import pyarrow.parquet as pq
 import pyarrow as pa
-import dask.dataframe as dd
-from dask.distributed import Client, LocalCluster
+import duckdb
 import shutil
 import glob
 import concurrent.futures
@@ -30,7 +29,7 @@ def main():
     valid_dttm = format_date(start_valid_dttm, "%d%b%Y:%H:%M:%S")
     field_name = "VALID_DTTM"
     batch_date_obj = datetime.strptime(start_valid_dttm,"%Y-%m-%d %H:%M:%S").date()
-    datetime_now = pd.Timestamp.now().strftime("%d%b%Y:%H:%M:%S")
+    datetime_now = datetime.now().strftime("%d%b%Y:%H:%M:%S")
     file_dt = batch_date_obj.strftime('%Y%m%d')
 
     # === PARQUET CONFIG ===
@@ -40,10 +39,9 @@ def main():
 
     # === PARALLEL RUN CONFIG ===
     batch_size = 5_000_000  # Number of rows per batch
-    merge_chunk_size = 20  # Number of batch files to merge at a time
-    max_workers = 20  # Number of Dask workers
-    memory_per_worker = '64GB'  # Set memory per worker to 32GB
-    
+    merge_chunk_size = 20  # unused now but left for compatibility
+    max_workers = 20       # Number of threads
+
     print(f"Table name : PBBDW.{tablename}", flush=True)
 
     # === CONNECT TO ORACLE ===
@@ -68,9 +66,9 @@ def main():
                 pa_type = pa.timestamp('ns')
             else:
                 pa_type = pa.string()
-            
+
             columns.append((col_name, pa_type))
-        
+
         cursor.close()
         connection.close()
         return pa.schema(columns)
@@ -87,10 +85,6 @@ def main():
 
     print(f"[INFO] Resuming from batch {last_completed_batch + 1}", flush=True)
 
-    # === DASK CLIENT SETUP ===
-    client = Client(n_workers=max_workers, threads_per_worker=1, memory_limit=memory_per_worker)  # Set memory per worker to 8GB
-    print(f"[INFO] Dask client started with {max_workers} workers and {memory_per_worker} memory limit per worker.", flush=True)
-
     # === EXTRACT DATA FROM ORACLE & SAVE AS PARQUET ===
     connection = create_ora_con_pbbdw()
     cursor = connection.cursor()
@@ -99,41 +93,31 @@ def main():
                    where {field_name} between TO_TIMESTAMP('{start_valid_dttm}','YYYY-MM-DD HH24:MI:SS') and  TO_TIMESTAMP('{end_valid_dttm}','YYYY-MM-DD HH24:MI:SS')""")
 
     def process_batch(batch_number, rows, cursor_description):
-        """Process a batch: Convert to Parquet and save."""
-        df = pd.DataFrame(rows, columns=[col[0] for col in cursor_description])
-        # df['VALID_DT'] = pd.to_datetime(valid_dt)
-        # df['VALID_DTTM'] = pd.to_datetime(start_valid_dttm)
-        # df['PROCESSED_DTTM'] = pd.Timestamp.now()
-        print(df.dtypes)
-        table = pa.Table.from_pandas(df,schema=oracle_schema)
-        print(table.schema)
+        """Process a batch: convert rows to Arrow/duckdb and write parquet."""
+        col_names = [col[0] for col in cursor_description]
+        # build an Arrow table directly from the list of tuples
+        table = pa.Table.from_pylist(
+            [dict(zip(col_names, row)) for row in rows],
+            schema=oracle_schema
+        )
+
         parquet_file = f"{parquet_dir}{tablename}batch{batch_number}.parquet"
-        pq.write_table(table, parquet_file)
+        # use duckdb to write the table – no pandas or DataFrame involved
+        conn = duckdb.connect()
+        conn.register("batch_tbl", table)
+        conn.execute(f"COPY batch_tbl TO '{parquet_file}' (FORMAT PARQUET)")
+        conn.close()
+
         # Save checkpoint
         with open(checkpoint_file, "w") as f:
             f.write(str(batch_number))
-
-        # Log every 1000 batches
+        
+        #Log every 1000 bacthes
         if batch_number % 10 == 0:
             print(f"[INFO] Completed {batch_number} at : {datetime.now()}", flush=True)
 
-    # Process in parallel
-    batch_number = 0
-    futures = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        while True:
-            rows = cursor.fetchmany(batch_size)
-            if not rows:
-                break
-            if batch_number <= last_completed_batch:
-                batch_number += 1
-                continue
-            futures.append(executor.submit(process_batch, batch_number, rows, cursor.description))
-            batch_number += 1
-            concurrent.futures.wait(futures)
-    
-    """
-    # Process in parallel (bounded in-flight futures to avoid serialism + control memory)
+    # Process in parallel 
+    # Bounded in-flight futures to avoid serialism + control memory
     MAX_INFLIGHT = max_workers * 2   # set to max_workers * 1 if memory is tight
 
     batch_number = 0
@@ -159,48 +143,22 @@ def main():
     # Drain remaining tasks at the end
     concurrent.futures.wait(concurrent.futures.futures)
 
-    """
-    
     cursor.close()
     connection.close()
 
     print("[INFO] Extraction complete. Merging Parquet files...", flush=True)
 
-    # === MERGE PARQUET FILES INTO SINGLE FILE ===
-    parquet_files = sorted([os.path.join(parquet_dir, f) for f in os.listdir(parquet_dir)
-                            if f.startswith(f"{tablename}batch") and f.endswith(".parquet")])
-    total_files = len(parquet_files)
-    chunks = [parquet_files[i:i + merge_chunk_size] for i in range(0, total_files, merge_chunk_size)]
-
-    def read_parquet_files(file_list):
-        """Reads multiple Parquet files and ensures schema consistency."""
-        tables = []
-        for file in file_list:
-            table = pq.read_table(file)
-            table = table.cast(oracle_schema)  # Ensure consistent schema
-            tables.append(table)
-        return tables
-
-    writer = None
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        for i, chunk in enumerate(chunks):
-            future = executor.submit(read_parquet_files, chunk)
-            tables = future.result()
-            combined_table = pa.concat_tables(tables)
-            if writer is None:
-                writer = pq.ParquetWriter(output_file, combined_table.schema)
-            writer.write_table(combined_table)
-            # Delete batch files after merging
-            for file in chunk:
-                os.remove(file)
-            
-        # print(f"[INFO] Merged and deleted {len(chunk)} batch files (Chunk {i + 1}/{len(chunks)})", flush=True)
-
-    if writer:
-        writer.close()
+    # use duckdb to concatenate every partial file into one
+    pattern = os.path.join(parquet_dir, f"{tablename}batch*.parquet")
+    con = duckdb.connect()
+    con.execute(f"COPY (SELECT * FROM read_parquet('{pattern}')) TO '{output_file}' (FORMAT PARQUET)")
+    con.close()
+    # remove the batch files
+    for f in glob.glob(pattern):
+        os.remove(f)
 
     # === PARQUET FILE VALIDATION ===
-    def get_oracle_stat(tablename,field_name,start_valid_dttm,end_valid_dttm):
+    def get_oracle_stat(tablename, field_name, start_valid_dttm, end_valid_dttm):
         connection = create_ora_con_pbbdw()
         cursor = connection.cursor()
 
@@ -214,23 +172,22 @@ def main():
 
         cursor.execute(query)
         row = cursor.fetchone()
-
         cursor.close()
         connection.close()
-
         return row
 
-    def get_parquet_stat(output_file,valid_dttm_column = f"{field_name}"):
-        table = pq.read_table(output_file,columns=[valid_dttm_column])
+    def get_parquet_stat(output_file, valid_dttm_column=field_name):
+        con = duckdb.connect()
+        con.execute(f"""
+            SELECT COUNT(*) AS row_count,
+                   MIN({valid_dttm_column}) AS min_val,
+                   MAX({valid_dttm_column}) AS max_val
+            FROM read_parquet('{output_file}')
+        """)
+        row = con.fetchone()
+        con.close()
+        return row
 
-        df = table.to_pandas()
-
-        row_count = len(df)
-        min_val = df[valid_dttm_column].min()
-        max_val = df[valid_dttm_column].max()
-
-        return row_count, min_val, max_val
-    
     def move_parquet_file(parquet_file_output):
         main_folder = Path("/parquet/current/DEPOSIT/")
         main_folder.mkdir(exist_ok=True)
@@ -262,33 +219,32 @@ def main():
             print(f"Error moving file : {e}")
             return False
 
-
-    oracle_count, oracle_min, oracle_max = get_oracle_stat(tablename,field_name,start_valid_dttm,end_valid_dttm)
-    print(f"Checking conversion for table : {tablename}",flush=True)
-    print("Oracle statistics:",flush=True)
-    print("Row count:", oracle_count,flush=True)
-    print("min VALID_DTTM:", oracle_min,flush=True)
-    print("max VALID_DTTM:", oracle_max,flush=True)
+    oracle_count, oracle_min, oracle_max = get_oracle_stat(tablename, field_name, start_valid_dttm, end_valid_dttm)
+    print(f"Checking conversion for table : {tablename}", flush=True)
+    print("Oracle statistics:", flush=True)
+    print("Row count:", oracle_count, flush=True)
+    print("min VALID_DTTM:", oracle_min, flush=True)
+    print("max VALID_DTTM:", oracle_max, flush=True)
 
     parquet_count, parquet_min, parquet_max = get_parquet_stat(output_file)
-    print("\nParquet statistics:",flush=True)
-    print("Row count:", parquet_count,flush=True)
-    print("min VALID_DTTM:", parquet_min,flush=True)
-    print("max VALID_DTTM:", parquet_max,flush=True)
+    print("\nParquet statistics:", flush=True)
+    print("Row count:", parquet_count, flush=True)
+    print("min VALID_DTTM:", parquet_min, flush=True)
+    print("max VALID_DTTM:", parquet_max, flush=True)
 
     # === VALIDATE AND MOVE TO FINAL FOLDER DELETE CHECKPOINT FILE ===
-    if oracle_count == parquet_count and oracle_max== parquet_max and oracle_min == parquet_min:
+    if oracle_count == parquet_count and oracle_max == parquet_max and oracle_min == parquet_min:
         destination_path = "/parquet/current"
         move_parquet_file(output_file)
         os.remove(checkpoint_file)
-        print("SUCCESS : Conversion complete and file moved",flush=True)
+        print("SUCCESS : Conversion complete and file moved", flush=True)
     else:
-        print("FAILED : Please check again",flush=True)
+        print("FAILED : Please check again", flush=True)
 
     # === COMPLETION LOG ===
     end_time = datetime.now()
     elapsed_time = end_time - start_time
-    print(f"[INFO] Merged {total_files} files into {output_file} successfully.", flush=True)
+    print(f"[INFO] Merged {len(glob.glob(pattern))} files into {output_file} successfully.", flush=True)
     print(f"[INFO] Program finished at: {end_time}", flush=True)
     print(f"[INFO] Total runtime: {elapsed_time}", flush=True)
 

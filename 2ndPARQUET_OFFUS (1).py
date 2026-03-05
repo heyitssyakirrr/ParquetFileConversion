@@ -1,0 +1,259 @@
+import os
+from datetime import datetime
+from pathlib import Path
+import re
+import pyarrow as pa
+import duckdb
+import shutil
+import glob
+import concurrent.futures
+from Data_Warehouse.Common.Jobs.ORA_CON import *  # Custom Oracle connection
+from Data_Warehouse.Common.Jobs.ORA_EXTRACTION import *
+from Data_Warehouse.Common.Jobs.GET_BATCH_DATE import *
+
+def main():
+    # === LOGGING ===
+    start_time = datetime.now()
+    print(f"[INFO] Program started at: {start_time}", flush=True)
+
+    # === CONFIGURATION ===
+
+    # === TABLE CONFIG ===
+    tablename = "DP_RPP_OFFUS"
+    # start_valid_dttm = get_batch_date_mart('DP')
+    # end_valid_dttm = last_date_of_batch_date(start_valid_dttm)
+    start_valid_dttm = '2024-01-01 00:00:00'
+    end_valid_dttm = '2024-12-31 23:59:59'
+    field_name = "VALID_DTTM"
+    batch_date_obj = datetime.strptime(start_valid_dttm, "%Y-%m-%d %H:%M:%S").date()
+    datetime_now = datetime.now().strftime("%d%b%Y:%H:%M:%S")
+    file_dt = batch_date_obj.strftime('%Y%m%d')
+
+    # === PARQUET CONFIG ===
+    parquet_dir = "/parquet/batches/"
+    output_file = f"{parquet_dir}{tablename}_{file_dt}_year2024.parquet"
+    checkpoint_file = f"/parquet/checkpoint/{tablename}_{file_dt}_year2024_CHECKPOINT.txt"
+
+    # === PARALLEL RUN CONFIG ===
+    batch_size = 5_000_000  # Number of rows per batch
+    max_workers = 20  # Number of threads
+
+    print(f"Table name : PBBDW.{tablename}", flush=True)
+
+    # === CONNECT TO ORACLE ===
+    def get_oracle_schema():
+        """Fetches column names and data types from Oracle to ensure consistency."""
+        connection = create_ora_con_pbbdw()
+        cursor = connection.cursor()
+        cursor.execute(f"""
+            SELECT COLUMN_NAME, DATA_TYPE
+            FROM ALL_TAB_COLUMNS
+            WHERE TABLE_NAME = '{tablename}'
+              AND OWNER = 'PBBDW'
+            ORDER BY COLUMN_ID
+        """)
+        columns = []
+        for col_name, data_type in cursor.fetchall():
+            if "NUMBER" in data_type:
+                pa_type = pa.float64()
+            elif "VARCHAR" in data_type or "CHAR" in data_type:
+                pa_type = pa.string()
+            elif "DATE" in data_type or "TIMESTAMP" in data_type:
+                pa_type = pa.timestamp('ns')
+            else:
+                pa_type = pa.string()
+            
+            columns.append((col_name, pa_type))
+        
+        cursor.close()
+        connection.close()
+        return pa.schema(columns)
+
+    # Fetch Oracle schema for consistency
+    print("[INFO] Fetching schema from Oracle...", flush=True)
+    oracle_schema = get_oracle_schema()
+
+    # === RESUME FROM CHECKPOINT ===
+    last_completed_batch = -1
+    if os.path.exists(checkpoint_file):
+        with open(checkpoint_file, "r") as f:
+            last_completed_batch = int(f.read().strip())
+
+    print(f"[INFO] Resuming from batch {last_completed_batch + 1}", flush=True)
+
+    # === EXTRACT DATA FROM ORACLE & SAVE AS PARQUET ===
+    connection = create_ora_con_pbbdw()
+    cursor = connection.cursor()
+    cursor.execute(f"""SELECT *
+                   FROM pbbdw.{tablename}
+                   WHERE {field_name} BETWEEN TO_TIMESTAMP('{start_valid_dttm}','YYYY-MM-DD HH24:MI:SS')
+                                         AND TO_TIMESTAMP('{end_valid_dttm}','YYYY-MM-DD HH24:MI:SS')""")
+
+    def process_batch(batch_number, rows, cursor_description):
+        """Process a batch: Convert to Arrow Table and write to Parquet using DuckDB."""
+        col_names = [col[0] for col in cursor_description]
+        
+        # Build PyArrow Table directly from rows
+        table = pa.Table.from_pylist(
+            [dict(zip(col_names, row)) for row in rows],
+            schema=oracle_schema
+        )
+        
+        parquet_file = f"{parquet_dir}{tablename}_year2024_batch{batch_number}.parquet"
+        
+        # Use DuckDB to write parquet (faster than pyarrow)
+        conn = duckdb.connect()
+        conn.register("batch_tbl", table)
+        conn.execute(f"COPY batch_tbl TO '{parquet_file}' (FORMAT PARQUET)")
+        conn.close()
+        
+        # Save checkpoint
+        with open(checkpoint_file, "w") as f:
+            f.write(str(batch_number))
+
+        # Log every 10 batches
+        if batch_number % 10 == 0:
+            print(f"[INFO] Completed {batch_number} at : {datetime.now()}", flush=True)
+
+    # Process in parallel 
+    # Bounded in-flight futures to avoid serialism + control memory
+    MAX_INFLIGHT = max_workers * 2   # set to max_workers * 1 if memory is tight
+
+    batch_number = 0
+    futures = set()
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        while True:
+            rows = cursor.fetchmany(batch_size)
+            if not rows:
+                break
+
+            if batch_number <= last_completed_batch:
+                batch_number += 1
+                continue
+
+            futures.add(executor.submit(process_batch, batch_number, rows, cursor.description))
+            batch_number += 1
+
+            # Only wait when we have "too many" tasks pending; wait for ONE to finish
+            if len(futures) >= MAX_INFLIGHT:
+                done, futures = concurrent.futures.wait(futures, return_when=concurrent.futures.FIRST_COMPLETED)
+
+    # Drain remaining tasks at the end
+    concurrent.futures.wait(concurrent.futures.futures)
+
+    cursor.close()
+    connection.close()
+
+    print("[INFO] Extraction complete. Merging Parquet files...", flush=True)
+
+    # === MERGE PARQUET FILES INTO SINGLE FILE USING DUCKDB ===
+    pattern = os.path.join(parquet_dir, f"{tablename}_year2024_batch*.parquet")
+    
+    # Use DuckDB to merge all batch files efficiently
+    conn = duckdb.connect()
+    conn.execute(f"COPY (SELECT * FROM read_parquet('{pattern}')) TO '{output_file}' (FORMAT PARQUET)")
+    conn.close()
+    
+    # Delete batch files after successful merge
+    for file in glob.glob(pattern):
+        os.remove(file)
+    
+    print(f"[INFO] Successfully merged all batch files into {output_file}", flush=True)
+
+    # === PARQUET FILE VALIDATION ===
+    def get_oracle_stat(tablename, field_name, start_valid_dttm, end_valid_dttm):
+        """Get statistics from Oracle table"""
+        connection = create_ora_con_pbbdw()
+        cursor = connection.cursor()
+
+        query = f"""
+            SELECT COUNT(*) AS row_count,
+                   MIN({field_name}) AS min_valid_dttm,
+                   MAX({field_name}) AS max_valid_dttm
+            FROM pbbdw.{tablename}
+            WHERE {field_name} BETWEEN TO_TIMESTAMP('{start_valid_dttm}','YYYY-MM-DD HH24:MI:SS')
+                                  AND TO_TIMESTAMP('{end_valid_dttm}','YYYY-MM-DD HH24:MI:SS')
+        """
+
+        cursor.execute(query)
+        row = cursor.fetchone()
+        cursor.close()
+        connection.close()
+
+        return row
+
+    def get_parquet_stat(output_file, valid_dttm_column=field_name):
+        """Get statistics from Parquet file using DuckDB (no pandas needed)"""
+        conn = duckdb.connect()
+        conn.execute(f"""
+            SELECT COUNT(*) AS row_count,
+                   MIN({valid_dttm_column}) AS min_val,
+                   MAX({valid_dttm_column}) AS max_val
+            FROM read_parquet('{output_file}')
+        """)
+        row = conn.fetchone()
+        conn.close()
+
+        return row
+    
+    def move_parquet_file(parquet_file_output):
+        """Move parquet file to final destination with year/month/day partitioning"""
+        main_folder = Path("/parquet/current/DEPOSIT/")
+        main_folder.mkdir(exist_ok=True)
+
+        output_file_path = Path(parquet_file_output)
+
+        match = re.search(r"(.+)_(\d{4})(\d{2})(\d{2})(\.parquet)", output_file_path.name)
+        if not match:
+            print(f"Error file name does not match pattern")
+            return False
+        name, year, month, day, extension = match.groups()
+
+        target_dir = main_folder / f"year={year}" / f"month={month}" / f"day={day}"
+        target_dir.mkdir(parents=True, exist_ok=True)
+
+        new_filename = f"{name}{extension}"
+        target_path = target_dir / new_filename
+
+        if target_path.exists():
+            print(f"Error : Parquet File already exists - {target_path}")
+            return False
+        try:
+            shutil.move(str(output_file_path), str(target_path))
+            print(f"Successfully moved {new_filename} to {target_path}")
+            return True
+        except Exception as e:
+            print(f"Error moving file : {e}")
+            return False
+
+    # === VALIDATION ===
+    oracle_count, oracle_min, oracle_max = get_oracle_stat(tablename, field_name, start_valid_dttm, end_valid_dttm)
+    print(f"Checking conversion for table : {tablename}", flush=True)
+    print("Oracle statistics:", flush=True)
+    print("Row count:", oracle_count, flush=True)
+    print("min VALID_DTTM:", oracle_min, flush=True)
+    print("max VALID_DTTM:", oracle_max, flush=True)
+
+    parquet_count, parquet_min, parquet_max = get_parquet_stat(output_file)
+    print("\nParquet statistics:", flush=True)
+    print("Row count:", parquet_count, flush=True)
+    print("min VALID_DTTM:", parquet_min, flush=True)
+    print("max VALID_DTTM:", parquet_max, flush=True)
+
+    # === VALIDATE AND MOVE TO FINAL FOLDER DELETE CHECKPOINT FILE ===
+    if oracle_count == parquet_count and oracle_max == parquet_max and oracle_min == parquet_min:
+        move_parquet_file(output_file)
+        os.remove(checkpoint_file)
+        print("SUCCESS : Conversion complete and file moved", flush=True)
+    else:
+        print("FAILED : Please check again", flush=True)
+
+    # === COMPLETION LOG ===
+    end_time = datetime.now()
+    elapsed_time = end_time - start_time
+    print(f"[INFO] Program finished at: {end_time}", flush=True)
+    print(f"[INFO] Total runtime: {elapsed_time}", flush=True)
+
+if __name__ == "__main__":
+    main()
