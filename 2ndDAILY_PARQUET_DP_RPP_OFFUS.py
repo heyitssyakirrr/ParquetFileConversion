@@ -88,7 +88,7 @@ def main():
 
     print(f"[INFO] (Info only) checkpoint says last completed batch = {last_completed_batch}", flush=True)
 
-    # Helper to standardize batch file paths (maintainable)
+    # Helper to standardize batch file paths
     def batch_paths(batch_number: int):
         parquet_file = os.path.join(parquet_dir, f"{tablename}batch{batch_number}.parquet")
         tmp_file = parquet_file + ".tmp"
@@ -99,9 +99,9 @@ def main():
     connection = create_ora_con_pbbdw()
     cursor = connection.cursor()
     cursor.execute(f"""SELECT *
-                   FROM pbbdw.{tablename}
-                   where {field_name} between TO_TIMESTAMP('{start_valid_dttm}','YYYY-MM-DD HH24:MI:SS')
-                     and TO_TIMESTAMP('{end_valid_dttm}','YYYY-MM-DD HH24:MI:SS')""")
+                    FROM pbbdw.{tablename}
+                    WHERE {field_name} between TO_TIMESTAMP('{start_valid_dttm}','YYYY-MM-DD HH24:MI:SS')
+                    AND TO_TIMESTAMP('{end_valid_dttm}','YYYY-MM-DD HH24:MI:SS')""")
 
     def process_batch(batch_number, rows, cursor_description):
         """
